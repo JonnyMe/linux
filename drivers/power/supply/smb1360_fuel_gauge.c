@@ -21,8 +21,20 @@
 #define BATT_FAST_CHG_VAL	0x2
 #define BATT_TAPER_CHG_VAL	0x3
 
+#define IRQ_A_REG		0x50
+#define IRQ_B_REG		0x51
+#define IRQ_C_REG		0x52
+#define IRQ_D_REG		0x53
 #define IRQ_E_REG		0x54
+#define IRQ_F_REG		0x55
+#define IRQ_G_REG		0x56
+#define IRQ_H_REG		0x57
+#define IRQ_I_REG		0x58
+
+#define IRQ_LATCHED_MASK	0x02
 #define IRQ_STATUS_MASK		0x01
+#define BATT_ID_LATCHED_MASK	0x08
+#define BATT_ID_STATUS_MASK	0x07
 #define BITS_PER_IRQ		2
 
 struct smb1360_battery {
@@ -30,11 +42,25 @@ struct smb1360_battery {
 	struct device		*dev;
 	struct regmap		*regmap;
 	struct power_supply	*psy;
-	struct mutex		read_write_lock;
+	struct mutex		irq_complete;
 
 	int battery_status;
 	int hot_bat_decidegc;
 	int cold_bat_decidegc;
+};
+
+struct smb_irq_info {
+	const char *name;
+	int (*smb_irq)(struct smb1360_battery *battery, u8 rt_stat);
+	int high;
+	int low;
+};
+
+struct irq_handler_info {
+	u8 reg;
+	u32 val;
+	u32 prev_val;
+	struct smb_irq_info irq_info[4];
 };
 
 static int smb1360_read_bytes(struct smb1360_battery *battery, int reg, u8 *val,
@@ -61,7 +87,8 @@ static int smb1360_get_prop_batt_overvoltage(struct smb1360_battery *battery)
 	if (ret)
 		return ret;
 
-	usbin_ov = reg & (IRQ_STATUS_MASK << (1 * BITS_PER_IRQ));
+	//usbin_ov = reg & (IRQ_STATUS_MASK << (1 * BITS_PER_IRQ));
+	usbin_ov = reg & GENMASK(2, 2);
 	return !!usbin_ov;
 }
 
@@ -239,25 +266,118 @@ static const struct regmap_config smb1360_battery_regmap_config = {
 	.val_bits	= 8,
 };
 
-static int battery_status_handler(struct smb1360_battery *battery,
-				  int battery_status)
+static struct irq_handler_info handlers[] = {
+	{ IRQ_A_REG, 0, 0, {
+		{ .name = "cold_soft", /*.smb_irq = cold_soft_handler,*/},
+		{ .name = "hot_soft", /*.smb_irq = hot_soft_handler,*/},
+		{ .name = "cold_hard", /*.smb_irq = cold_hard_handler,*/},
+		{ .name = "hot_hard", /*.smb_irq = hot_hard_handler,*/},
+	}},
+	{ IRQ_B_REG, 0, 0, {
+		{ .name = "chg_hot", /*.smb_irq = chg_hot_handler,*/},
+		{ .name = "vbat_low", /*.smb_irq = vbat_low_handler,*/},
+		{ .name = "battery_missing", /*.smb_irq = battery_missing_handler,*/},
+		{ .name = "battery_missing", /*.smb_irq = battery_missing_handler,*/},
+	}},
+	{ IRQ_C_REG, 0, 0, {
+		{ .name = "chg_term", /*.smb_irq = chg_term_handler,*/},
+		{ .name = "taper", },
+		{ .name = "recharge", },
+		{ .name = "fast_chg", /*.smb_irq = chg_fastchg_handler,*/},
+	}},
+	{ IRQ_D_REG, 0, 0, {
+		{ .name = "prechg_timeout", },
+		{ .name = "safety_timeout", },
+		{ .name = "aicl_done", /*.smb_irq = aicl_done_handler,*/},
+		{ .name = "battery_ov", /*.smb_irq = batt_ov_handler,*/},
+	}},
+	{ IRQ_E_REG, 0, 0, {
+		{ .name = "usbin_uv", /*.smb_irq = usbin_uv_handler,*/},
+		{ .name = "usbin_ov", /*.smb_irq = usbin_ov_handler,*/},
+		{ .name = "unused", },
+		{ .name = "chg_inhibit", /*.smb_irq = chg_inhibit_handler,*/},
+	}},
+	{ IRQ_F_REG, 0, 0, {
+		{ .name = "power_ok", },
+		{ .name = "unused", },
+		{ .name = "otg_fail", /*.smb_irq = otg_fail_handler,*/},
+		{ .name = "otg_oc", /*.smb_irq = otg_oc_handler,*/},
+	}},
+	{ IRQ_G_REG, 0, 0, {
+		{ .name = "delta_soc", /*.smb_irq = delta_soc_handler,*/},
+		{ .name = "chg_error", },
+		{ .name = "wd_timeout", },
+		{ .name = "unused", },
+	}},
+	{ IRQ_H_REG, 0, 0, {
+		{ .name = "min_soc", /*.smb_irq = min_soc_handler,*/},
+		{ .name = "max_soc", },
+		{ .name = "empty_soc", /*.smb_irq = empty_soc_handler,*/},
+		{ .name = "full_soc", /*.smb_irq = full_soc_handler,*/},
+	}},
+	{ IRQ_I_REG, 0, 0, {
+		{ .name = "fg_access_allowed", /*.smb_irq = fg_access_allowed_handler,*/},
+		{ .name = "fg_data_recovery", },
+		{ .name = "batt_id_complete", /*.smb_irq = batt_id_complete_handler,*/},
+	}},
+};
+
+static bool process_irq_handler(struct smb1360_battery *battery,
+				struct irq_handler_info *handler)
 {
-	if (battery->battery_status != battery_status) {
-		power_supply_changed(battery->psy);
+	bool handled = false;
+	u8 triggered, changed;
+	u8 rt_stat, prev_rt_stat, irq_latched_mask, irq_status_mask;
+	int j, rc;
+
+	rc = regmap_read(battery->regmap, handler->reg, &handler->val);
+	if (rc < 0) {
+		dev_err(battery->dev,
+			"Couldn't read %d rc = %d\n", handler->reg, rc);
+		return false;
 	}
 
-	battery->battery_status = battery_status;
+	for (j = 0; j < ARRAY_SIZE(handler->irq_info); j++) {
+		if (handler->reg == IRQ_I_REG && j == 2) {
+			irq_latched_mask = BATT_ID_LATCHED_MASK;
+			irq_status_mask = BATT_ID_STATUS_MASK;
+		} else {
+			irq_latched_mask = IRQ_LATCHED_MASK;
+			irq_status_mask = IRQ_STATUS_MASK;
+		}
 
-	return 0;
+		triggered = handler->val & (irq_latched_mask << (j * BITS_PER_IRQ));
+		rt_stat = handler->val & (irq_status_mask << (j * BITS_PER_IRQ));
+		prev_rt_stat = handler->prev_val & (irq_status_mask << (j * BITS_PER_IRQ));
+		changed = prev_rt_stat ^ rt_stat;
+
+		if (triggered || changed) {
+			handled = true;
+			rt_stat ? handler->irq_info[j].high++ : handler->irq_info[j].low++;
+		}
+	}
+	handler->prev_val = handler->val;
+
+	return handled;
 }
 
 static irqreturn_t smb1360_bat_irq(int irq, void *data)
 {
 	struct smb1360_battery *battery = data;
-	int battery_status;
+	bool result, handled = false;
+	int i;
 
-	battery_status = smb1360_get_prop_batt_status(battery);
-	battery_status_handler(battery, battery_status);
+	mutex_lock(&chip->irq_complete);
+
+	for (i = 0; i < ARRAY_SIZE(handlers); i++) {
+		result = process_irq_handler(battery, &handlers[i]);
+		handled = handled ? handled : result;
+	}
+
+	if (handled)
+		power_supply_changed(battery->psy);
+
+	mutex_unlock(&chip->irq_complete);
 
 	return IRQ_HANDLED;
 }
@@ -302,8 +422,6 @@ static int smb1360_fg_probe(struct i2c_client *client)
 		dev_err(&client->dev, "failed to allocate memory\n");
 		return -EINVAL;
 	}
-
-	mutex_init(&battery->read_write_lock);
 
 	battery->client = client;
 
