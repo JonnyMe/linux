@@ -455,6 +455,7 @@ static int yushun_nt35520_remove(struct mipi_dsi_device *dsi)
 
 static const struct of_device_id yushun_nt35520_of_match[] = {
 	{ .compatible = "yushun,nt35520" }, // FIXME
+	{ .compatible = "longcheer,yushun-nt35520" }, // FIXME
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, yushun_nt35520_of_match);
