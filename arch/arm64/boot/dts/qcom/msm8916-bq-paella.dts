@@ -174,7 +174,7 @@
 	pinctrl-1 = <&mdss_suspend>;
 
 	panel@0 {
-		compatible = "yushun,nt35520";
+		compatible = "longcheer,l8910-panel";
 		reg = <0>;
 
 		backlight = <&backlight>;
