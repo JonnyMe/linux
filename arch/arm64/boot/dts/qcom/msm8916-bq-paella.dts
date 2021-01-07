@@ -175,6 +175,7 @@
 		qcom,batt-id-rpullup-kohm = <100>;
 		qcom,profile-a-rid-kohm = <100>;
 		qcom,profile-b-rid-kohm = <200>;
+		qcom,rsense-10mhom;
 
 		usb_otg_vbus: usb-otg-vbus {};
 	};

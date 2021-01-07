@@ -170,6 +170,8 @@
 #define SMB1360_POWERON_DELAY_MS	2000
 #define SMB1360_FG_RESET_DELAY_MS	1500
 
+#define CFG_FG_OTP_BACK_UP_ENABLE	BIT(7)
+
 #define BATT_PROFILE_SELECT_MASK	GENMASK(3, 0)
 #define BATT_PROFILEA_MASK		0x0
 #define BATT_PROFILEB_MASK		0xF
@@ -178,6 +180,11 @@
 #define BATT_ID_SHIFT			4
 
 #define BATTERY_PROFILE_BIT		BIT(0)
+
+#define FG_I2C_CFG_MASK			GENMASK(2, 1)
+#define FG_CFG_I2C_ADDR			0x2
+#define CURRENT_GAIN_LSB_REG		0x1D
+#define CURRENT_GAIN_MSB_REG		0x1E
 
 enum {
 	BATTERY_PROFILE_A,
@@ -234,6 +241,7 @@ struct smb1360_battery {
 	bool iterm_disabled;
 	bool shdn_after_pwroff;
 	bool fg_reset_at_pon;
+	bool rsense_10mohm;
 };
 
 static enum power_supply_property smb1360_battery_props[] = {
@@ -254,6 +262,95 @@ struct ob_register {
 	void (*read_op)(struct smb1360_battery *battery, struct ob_register *smb1360_obreg);
 
 };
+
+#define EXPONENT_MASK		0xF800
+#define MANTISSA_MASK		0x3FF
+#define SIGN_MASK		0x400
+#define EXPONENT_SHIFT		11
+#define SIGN_SHIFT		10
+#define MICRO_UNIT		1000000ULL
+static int64_t float_decode(u16 reg)
+{
+	int64_t final_val, exponent_val, mantissa_val;
+	int exponent, mantissa, n;
+	bool sign;
+
+	exponent = (reg & EXPONENT_MASK) >> EXPONENT_SHIFT;
+	mantissa = (reg & MANTISSA_MASK);
+	sign = !!(reg & SIGN_MASK);
+
+	pr_debug("exponent=%d mantissa=%d sign=%d\n", exponent, mantissa, sign);
+
+	mantissa_val = mantissa * MICRO_UNIT;
+
+	n = exponent - 15;
+	if (n < 0)
+		exponent_val = MICRO_UNIT >> -n;
+	else
+		exponent_val = MICRO_UNIT << n;
+
+	n = n - 10;
+	if (n < 0)
+		mantissa_val >>= -n;
+	else
+		mantissa_val <<= n;
+
+	final_val = exponent_val + mantissa_val;
+
+	if (sign)
+		final_val *= -1;
+
+	return final_val;
+}
+
+#define MAX_MANTISSA    (1023 * 1000000ULL)
+unsigned int float_encode(int64_t float_val)
+{
+	int exponent = 0, sign = 0;
+	unsigned int final_val = 0;
+
+	if (float_val == 0)
+		return 0;
+
+	if (float_val < 0) {
+		sign = 1;
+		float_val = -float_val;
+	}
+
+	/* Reduce large mantissa until it fits into 10 bit */
+	while (float_val >= MAX_MANTISSA) {
+		exponent++;
+		float_val >>= 1;
+	}
+
+	/* Increase small mantissa to improve precision */
+	while (float_val < MAX_MANTISSA && exponent > -25) {
+		exponent--;
+		float_val <<= 1;
+	}
+
+	exponent = exponent + 25;
+
+	/* Convert mantissa from micro-units to units */
+	float_val = div_s64((float_val + MICRO_UNIT), (int)MICRO_UNIT);
+
+	if (float_val == 1024) {
+		exponent--;
+		float_val <<= 1;
+	}
+
+	float_val -= 1024;
+
+	/* Ensure that resulting number is within range */
+	if (float_val > MANTISSA_MASK)
+		float_val = MANTISSA_MASK;
+
+	/* Convert to 5 bit exponent, 11 bit mantissa */
+	final_val = (float_val & MANTISSA_MASK) | (sign << SIGN_SHIFT) |
+		((exponent << EXPONENT_SHIFT) & EXPONENT_MASK);
+
+	return final_val;
+}
 
 static void reg_byte_read(struct smb1360_battery *battery, struct ob_register *smb1360_obreg)
 {
@@ -770,6 +867,9 @@ static int smb1360_iterm_set(struct smb1360_battery *battery)
 	if (battery->iterm_ma == -EINVAL)
 		return 0;
 
+	if (battery->rsense_10mohm)
+		battery->iterm_ma = battery->iterm_ma / 2;
+
 	val = clamp(battery->iterm_ma, 25, 200);
 	val = DIV_ROUND_UP(val, 25) - 1;
 
@@ -1061,6 +1161,96 @@ static int smb1360_check_batt_profile(struct smb1360_battery *battery)
 	return 0;
 }
 
+static int smb1360_adjust_current_gain(struct smb1360_battery *battery)
+{
+	int ret;
+
+	struct i2c_client *client = to_i2c_client(battery->dev);
+	union i2c_smbus_data data;
+
+	u8 reg[2];
+	u16 current_gain_encoded, fg_address;
+	int64_t current_gain;
+
+	fg_address = client->addr << 0x1;
+	fg_address = (fg_address & ~FG_I2C_CFG_MASK) | FG_CFG_I2C_ADDR;
+	fg_address = fg_address >> 0x1;
+
+	ret = i2c_smbus_xfer(client->adapter, fg_address, client->flags,
+			     I2C_SMBUS_READ, CURRENT_GAIN_LSB_REG,
+			     I2C_SMBUS_BYTE_DATA, &data);
+	if (ret < 0)
+		return ret;
+	reg[0] = data.byte;
+
+	ret = i2c_smbus_xfer(client->adapter, fg_address, client->flags,
+			     I2C_SMBUS_READ, CURRENT_GAIN_MSB_REG,
+			     I2C_SMBUS_BYTE_DATA, &data);
+	if (ret < 0)
+		return ret;
+	reg[1] = data.byte;
+
+	current_gain_encoded = (reg[1] << 8) | reg[0];
+	dev_info(battery->dev, "FG_I2C_CURRENT_GAIN: %d", current_gain_encoded);
+
+	current_gain = float_decode(current_gain_encoded);
+	current_gain = MICRO_UNIT  + (2 * current_gain);
+
+	current_gain_encoded = float_encode(current_gain);
+	dev_info(battery->dev, "FG_I2C_NEW_GAIN: %d", current_gain_encoded);
+
+	data.byte = 0x1D;
+	ret = i2c_smbus_xfer(client->adapter, fg_address, client->flags,
+			     I2C_SMBUS_WRITE, 0xE0,
+			     I2C_SMBUS_BYTE_DATA, &data);
+	if (ret)
+		return ret;
+
+	data.byte = current_gain_encoded & 0xFF;
+	ret = i2c_smbus_xfer(client->adapter, fg_address, client->flags,
+			     I2C_SMBUS_WRITE, 0xE1,
+			     I2C_SMBUS_BYTE_DATA, &data);
+	if (ret)
+		return ret;
+
+	data.byte = 0x1E;
+	ret = i2c_smbus_xfer(client->adapter, fg_address, client->flags,
+			     I2C_SMBUS_WRITE, 0xE2,
+			     I2C_SMBUS_BYTE_DATA, &data);
+	if (ret)
+		return ret;
+
+	data.byte = (current_gain_encoded & 0xFF00) >> 8;
+	ret = i2c_smbus_xfer(client->adapter, fg_address, client->flags,
+			     I2C_SMBUS_WRITE, 0xE3,
+			     I2C_SMBUS_BYTE_DATA, &data);
+
+	return ret;
+}
+
+static int smb1360_reconf_gain_otp(struct smb1360_battery *battery)
+{
+	int ret;
+	
+	ret = smb1360_enable_fg_access(battery);
+	if (ret)
+		return ret;
+
+	ret = smb1360_adjust_current_gain(battery);
+	if (ret) {
+		ret = smb1360_disable_fg_access(battery);
+		return ret;
+	}
+
+	ret = regmap_update_bits(battery->regmap, CFG_FG_BATT_CTRL_REG,
+				 CFG_FG_OTP_BACK_UP_ENABLE,
+				 CFG_FG_OTP_BACK_UP_ENABLE);
+
+	ret = smb1360_disable_fg_access(battery);
+
+	return ret;
+}
+
 static int smb1360_delayed_hw_init(struct smb1360_battery *battery)
 {
 	int ret;
@@ -1069,6 +1259,15 @@ static int smb1360_delayed_hw_init(struct smb1360_battery *battery)
 	if (ret) {
 		dev_err(battery->dev, "unable to modify battery profile: %d\n", ret);
 		return ret;
+	}
+
+	if (battery->rsense_10mohm) {
+		ret = smb1360_reconf_gain_otp(battery);
+		if (ret) {
+			dev_err(battery->dev, 
+				"couldn't reconfigure gain for lower resistance: %d\n", ret);
+			return ret;
+		}
 	}
 
 	ret = smb1360_fg_config(battery);
@@ -1190,6 +1389,8 @@ static int smb1360_parse_properties(struct smb1360_battery *battery)
 		device_property_read_bool(dev,	"qcom,shdn-after-pwroff");
 	battery->fg_reset_at_pon =
 		device_property_read_bool(dev, "qcom,fg-reset-at-pon");
+	battery->rsense_10mohm =
+		device_property_read_bool(dev, "qcom,rsense-10mhom");
 
 	if (device_property_read_bool(dev, "qcom,batt-profile-select")) {
 		ret = smb_parse_batt_id(battery);
