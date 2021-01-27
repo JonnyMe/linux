@@ -98,6 +98,32 @@
 		};
 	};
 
+	reg_cam_vdda: regulator-vdda-camera {
+		compatible = "regulator-fixed";
+		regulator-name = "regulator-vdda-camera";
+		regulator-min-microvolt = <2700000>;
+		regulator-max-microvolt = <2700000>;
+
+		gpio = <&msmgpio 34 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_vdda_default>;
+	};
+
+	reg_cam_vddd: regulator-vddd-camera {
+		compatible = "regulator-fixed";
+		regulator-name = "regulator-vddd-camera";
+		regulator-min-microvolt = <1120000>;
+		regulator-max-microvolt = <1120000>;
+
+		gpio = <&msmgpio 31 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_vddd_default>;
+	};
+
 	reg_ts_vcca: regulator-vcca-ts {
 		compatible = "regulator-fixed";
 		regulator-name = "regulator-vcca-ts";
@@ -117,6 +143,10 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <&usb_id_default &usb_id_switch_default>;
 	};
+};
+
+&blsp_i2c2 {
+	status = "okay";
 };
 
 &blsp_i2c3 {
@@ -224,6 +254,53 @@
 
 &blsp1_uart2 {
 	status = "okay";
+};
+
+&camss {
+	status = "okay";
+
+	ports {
+		port@0 {
+			reg = <0>;
+			csiphy0_ep: endpoint {
+				clock-lanes = <1>;
+				data-lanes = <0 2 3 4>;
+				remote-endpoint = <&imx214_ep>;
+			};
+		};
+	};
+};
+
+&cci {
+	status = "okay";
+};
+
+&cci_i2c0 {
+	imx214@10 {
+		compatible = "sony,imx214";
+		reg = <0x10>;
+
+		vdda-supply = <&reg_cam_vdda>;
+		vddd-supply = <&reg_cam_vddd>;
+		vdddo-supply = <&pm8916_l6>;
+
+		enable-gpios = <&msmgpio 35 GPIO_ACTIVE_HIGH>;
+
+		clocks = <&gcc GCC_CAMSS_MCLK0_CLK>;
+		assigned-clocks = <&gcc GCC_CAMSS_MCLK0_CLK>;
+		assigned-clock-rates = <23880000>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&imx214_default>, <&imx214_enable_default>;
+
+		port {
+			imx214_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <243200000>;
+				remote-endpoint = <&csiphy0_ep>;
+			};
+		};
+	};
 };
 
 &dsi0 {
@@ -462,12 +539,44 @@
 		bias-disable;
 	};
 
+	cam_vddd_default: cam-vddd-default {
+		pins = "gpio31";
+		function = "gpio";
+
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam_vdda_default: cam-vdda-default {
+		pins = "gpio34";
+		function = "gpio";
+
+		drive-strength = <2>;
+		bias-disable;
+	};
+
 	gpio_keys_default: gpio-keys-default {
 		pins = "gpio107";
 		function = "gpio";
 
 		drive-strength = <2>;
 		bias-pull-up;
+	};
+
+	imx214_default: imx214_default {
+		pins = "gpio26";
+		function = "cam_mclk0";
+
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	imx214_enable_default: imx214_enable_default {
+		pins = "gpio35";
+		function = "gpio";
+
+		drive-strength = <2>;
+		bias-disable;
 	};
 
 	mag_reset_default: mag-reset-default {
